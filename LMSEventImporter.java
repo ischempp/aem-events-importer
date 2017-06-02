@@ -1,20 +1,23 @@
 package org.fhcrc.centernet.service;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
+import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLConnection;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.Dictionary;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 
 import javax.jcr.Node;
-import javax.jcr.PathNotFoundException;
 import javax.jcr.RepositoryException;
 import javax.jcr.Session;
 
@@ -42,8 +45,11 @@ import org.slf4j.LoggerFactory;
 import com.day.cq.wcm.api.Page;
 import com.day.cq.wcm.api.PageManager;
 import com.day.cq.wcm.api.WCMException;
+import com.day.cq.tagging.TagManager;
+import com.day.cq.tagging.Tag;
 
 import org.fhcrc.centernet.Constants;
+import org.fhcrc.common.util.PageUtilities;
 
 @Service(value = java.lang.Runnable.class)
 @Component(name = "org.fhcrc.centernet.service.LMSEventImporter", 
@@ -90,6 +96,8 @@ public class LMSEventImporter implements Runnable {
 	private static final String EVENT_BUTTON_TEXT_VALUE = "Register";
 	private static final String PN_EVENT_BUTTON_URL = "linkUrl";
 	private static final String PN_EVENT_UID = "eventId";
+	private static final String TRAINING_EVENT_CATEGORY_TAG_ID = "web-event-categories:training";
+	private static final String TRAINING_DEPARTMENT_TAG_ID = "web-depts:AD/AD0603";
 	
 	/* The fields we expect to get from the data file and their order */
 	private final Integer TITLE = 0;
@@ -117,6 +125,7 @@ public class LMSEventImporter implements Runnable {
 	private String dataSource;
 	private Session adminSession;
 	private PageManager pageManager;
+	private TagManager tagManager;
 	private ResourceResolver resResolver;
 	private Map<String, String> uidMap;
 	
@@ -162,20 +171,21 @@ public class LMSEventImporter implements Runnable {
 				log.debug(LOGGING_PREFIX + "inputLine = " + inputLine);
 				String[] data = inputLine.split("\t");
 				if (data.length != EXPECTED_NUMBER_OF_FIELDS) {
+					//TODO Send an email to HR alerting them of the failure and the data that failed.
 					log.error(LOGGING_PREFIX + "Unexpected number of fields from LMS output. Aborting line starting with " + data[0]);
 					continue;
 				} else {
 					
-					if (uidMap != null && uidMap.containsKey(data[UID])) {
-						deleteEventNode(data);
-					}
 					createEventNode(data);
+					
 				}
 				
 			}
 			
-		} catch (Exception e) {
-			log.error(LOGGING_PREFIX, e);
+		} catch (MalformedURLException e) {
+			log.error(LOGGING_PREFIX + "Incorrect URL for data file: " + dataSource);
+		} catch (IOException e) {
+			log.error(LOGGING_PREFIX + "Problem reading data file");
 		}
 		
 	}
@@ -206,55 +216,6 @@ public class LMSEventImporter implements Runnable {
 		} catch (ParseException e) {
 			log.error(LOGGING_PREFIX + "Incorrectly formatted date string: " + dateString + " " + timeString, e);
 			return null;
-		}
-		
-	}
-	
-	private String sanitizeTitle(String string) {
-		String result = string.toLowerCase();
-		result = result.replaceAll(" ", "-");
-		result = result.replaceAll("[^a-zA-Z0-9_\\s]", "-");
-		return result;
-	}
-	
-	@SuppressWarnings("deprecation")
-	private void deleteEventNode(String[] data) {
-		
-		String path = uidMap.get(data[UID]);
-		
-		if (path != null) {
-			
-			log.debug(LOGGING_PREFIX + "Deleting node at path " + path);
-			
-			try {
-				
-				resResolver = factory.getAdministrativeResourceResolver(null);
-				adminSession = resResolver.adaptTo(Session.class);
-				
-				Node deleteNode = adminSession.getNode(path);
-				
-				if (deleteNode != null) {
-					deleteNode.remove();
-					adminSession.save();
-				}
-				
-				adminSession.logout();
-				
-			} catch (LoginException e) {
-				log.error(LOGGING_PREFIX + "Problem logging in admin session for UID Map", e);
-			} catch (PathNotFoundException e) {
-				log.error(LOGGING_PREFIX + "No Node found at path " + path, e);
-			} catch (RepositoryException e) {
-				log.error(LOGGING_PREFIX + "Problem getting Node for deletion", e);
-			} finally {
-
-				/* Double-check that we are logged out */
-				if (adminSession != null) {
-					adminSession.logout();
-				}
-				
-			}
-			
 		}
 		
 	}
@@ -299,10 +260,26 @@ public class LMSEventImporter implements Runnable {
 			resResolver = factory.getAdministrativeResourceResolver(null);
 			adminSession = resResolver.adaptTo(Session.class);
 			pageManager = resResolver.adaptTo(PageManager.class);
+			tagManager = resResolver.adaptTo(TagManager.class);
 			
 			Page eventPage = null;
 			String pageName = null;
+			Tag categoryTag = tagManager.resolve(TRAINING_EVENT_CATEGORY_TAG_ID),
+					departmentTag = tagManager.resolve(TRAINING_DEPARTMENT_TAG_ID);
+			List<Tag> tagList = new ArrayList<Tag>();
 			
+			if (categoryTag != null) {
+				tagList.add(categoryTag);
+			} else {
+				log.warn(LOGGING_PREFIX + "Problem resolving category tag " + TRAINING_EVENT_CATEGORY_TAG_ID);
+			}
+			
+			if (departmentTag != null) {
+				tagList.add(departmentTag);
+			} else {
+				log.warn(LOGGING_PREFIX + "Problem resolving department tag " + TRAINING_DEPARTMENT_TAG_ID);
+			}
+						
 			String[] dateParts = data[START_DATE].split("/");
 			/* Make sure we actually have a date here */
 			if (dateParts.length > 1) {
@@ -317,7 +294,7 @@ public class LMSEventImporter implements Runnable {
 				if (data[TITLE] != null && !data[TITLE].isEmpty()) {
 					// 57 is 64 - (length of month string + length of day string + 2 hyphens)
 					pageName = data[TITLE].substring(0, Math.min(data[TITLE].length(), 57));
-					pageName = sanitizeTitle(pageName);
+					pageName = PageUtilities.EscapePageTitle(pageName);
 				} else {
 					pageName = DEFAULT_PAGE_NAME;
 				}
@@ -325,68 +302,85 @@ public class LMSEventImporter implements Runnable {
 				pageName = pageName + "-" + justTheMonth.format(startCal.getTime());
 				pageName = pageName + "-" + justTheDay.format(startCal.getTime()); 
 				
-				if (importPathWithDate.hasNode(pageName)) {
-					//TODO Update node instead of create
-					eventPage = null;
+				/* If the page is in our uidMap, then it already exists and we can just update the existing page */
+				if (uidMap != null && uidMap.containsKey(data[UID])) {
+					
+					eventPage = pageManager.getPage(uidMap.get(data[UID]));
+					if (eventPage == null) {
+						log.error(LOGGING_PREFIX + "Problem getting page for update " + uidMap.get(data[UID]));
+						return;
+					}
+					
 				} else {
+					
+					/* If it was not in the uidMap, then create a new page */
 					eventPage = pageManager.create(importPathWithDate.getPath(), pageName, Constants.EVENT_TEMPLATE, data[TITLE]);
-					Node eventPageContentNode = eventPage.getContentResource().adaptTo(Node.class);
-					/* Set the basic scaffolding and page type of the created page */
-		            eventPageContentNode.setProperty(PROP_SCAFFOLDING, EVENT_SCAFFOLDING_TEMPLATE);
-		            eventPageContentNode.setProperty(PROP_RESOURCE_TYPE, EVENT_COMPONENT_RES);
-		            /* Create the eventdetails node */
-		            Node eventDetailsNode = JcrUtils.getOrCreateByPath(eventPageContentNode.getPath() + "/" + EVENT_DETAILS_NODE, "nt:unstructured", adminSession);
+					
+				}
+				
+				Node eventPageContentNode = eventPage.getContentResource().adaptTo(Node.class);
+				/* Set the basic scaffolding and page type of the created page */
+				eventPageContentNode.setProperty(PROP_SCAFFOLDING, EVENT_SCAFFOLDING_TEMPLATE);
+				eventPageContentNode.setProperty(PROP_RESOURCE_TYPE, EVENT_COMPONENT_RES);
+				/* Create the eventdetails node */
+				Node eventDetailsNode = JcrUtils.getOrCreateByPath(eventPageContentNode.getPath() + "/" + EVENT_DETAILS_NODE, "nt:unstructured", adminSession);
 
-		            if (startCal == null) {
-		            	//TODO More drastic action should be taken here, send an email alert?
-		            } else {
-		            	eventDetailsNode.setProperty(PN_EVENT_START, startCal);
-		            }
+				if (startCal == null) {
+					//TODO More drastic action should be taken here, send an email alert?
+				} else {
+					eventDetailsNode.setProperty(PN_EVENT_START, startCal);
+				}
 
-		            if (endCal == null) {
-		            	//TODO More drastic action should be taken here, send an email alert?
-		            } else {
-		            	eventDetailsNode.setProperty(PN_EVENT_END, endCal);
-		            }
-		            
-		            
-		            /* Start setting properties if they exist */
-		            if (!data[DESCRIPTION].trim().isEmpty()) {
-		            	eventDetailsNode.setProperty(PN_EVENT_DESCRIPTION, data[DESCRIPTION]);
-		            }
-		            if (!data[LOCATION].trim().isEmpty()) {
-		            	eventDetailsNode.setProperty(PN_EVENT_LOCATION, data[LOCATION]);
-		            }
-		            if (!data[HOST].trim().isEmpty()) {
-		            	eventDetailsNode.setProperty(PN_EVENT_HOST, data[HOST]);
-		            }
-		            if (!data[CONTACT_NAME].trim().isEmpty()) {
-		            	eventDetailsNode.setProperty(PN_EVENT_CONTACT_NAME, data[CONTACT_NAME]);
-		            }
-		            if (!data[CONTACT_EMAIL].trim().isEmpty()) {
-		            	eventDetailsNode.setProperty(PN_EVENT_CONTACT_EMAIL, data[CONTACT_EMAIL]);
-		            }
-		            if (!data[CONTACT_PHONE].trim().isEmpty()) {
-		            	eventDetailsNode.setProperty(PN_EVENT_CONTACT_PHONE, data[CONTACT_PHONE]);
-		            }
-		            
-		            /* The Deep Link should be rendered as a Register button */
-		            if (!data[DEEP_LINK].trim().isEmpty()) {
-		            	Node eventButtonNode = JcrUtils.getOrCreateByPath(eventDetailsNode.getPath() + "/" + EVENT_BUTTON_NODE, "nt:unstructured", adminSession);
-		            	eventButtonNode.setProperty(PN_EVENT_BUTTON_TEXT, EVENT_BUTTON_TEXT_VALUE);
-		            	eventButtonNode.setProperty(PN_EVENT_BUTTON_URL, data[DEEP_LINK]);
-		            }
-		            
-		            
-		            /* The summary is set as the jcr:description which goes on the jcr:content node */
-		            if (!data[SUMMARY].trim().isEmpty()) {
-		            	eventPageContentNode.setProperty(PN_EVENT_SUMMARY, data[SUMMARY]);
-		            }
-		            /* Store the UID on the jcr:content node as well */
-		            if (!data[UID].trim().isEmpty()) {
-		            	eventPageContentNode.setProperty(PN_EVENT_UID, data[UID]);
-		            }
-		            
+				if (endCal == null) {
+					//TODO More drastic action should be taken here, send an email alert?
+				} else {
+					eventDetailsNode.setProperty(PN_EVENT_END, endCal);
+				}
+
+
+				/* Start setting properties if they exist */
+				if (!data[DESCRIPTION].trim().isEmpty()) {
+					eventDetailsNode.setProperty(PN_EVENT_DESCRIPTION, data[DESCRIPTION]);
+				}
+				if (!data[LOCATION].trim().isEmpty()) {
+					eventDetailsNode.setProperty(PN_EVENT_LOCATION, data[LOCATION]);
+				}
+				if (!data[HOST].trim().isEmpty()) {
+					eventDetailsNode.setProperty(PN_EVENT_HOST, data[HOST]);
+				}
+				if (!data[CONTACT_NAME].trim().isEmpty()) {
+					eventDetailsNode.setProperty(PN_EVENT_CONTACT_NAME, data[CONTACT_NAME]);
+				}
+				if (!data[CONTACT_EMAIL].trim().isEmpty()) {
+					eventDetailsNode.setProperty(PN_EVENT_CONTACT_EMAIL, data[CONTACT_EMAIL]);
+				}
+				if (!data[CONTACT_PHONE].trim().isEmpty()) {
+					eventDetailsNode.setProperty(PN_EVENT_CONTACT_PHONE, data[CONTACT_PHONE]);
+				}
+
+				/* The Deep Link should be rendered as a Register button */
+				if (!data[DEEP_LINK].trim().isEmpty()) {
+					Node eventButtonNode = JcrUtils.getOrCreateByPath(eventDetailsNode.getPath() + "/" + EVENT_BUTTON_NODE, "nt:unstructured", adminSession);
+					eventButtonNode.setProperty(PN_EVENT_BUTTON_TEXT, EVENT_BUTTON_TEXT_VALUE);
+					eventButtonNode.setProperty(PN_EVENT_BUTTON_URL, data[DEEP_LINK]);
+				}
+
+
+				/* The summary is set as the jcr:description which goes on the jcr:content node */
+				if (!data[SUMMARY].trim().isEmpty()) {
+					eventPageContentNode.setProperty(PN_EVENT_SUMMARY, data[SUMMARY]);
+				}
+				/* Store the UID on the jcr:content node as well */
+				if (!data[UID].trim().isEmpty()) {
+					eventPageContentNode.setProperty(PN_EVENT_UID, data[UID]);
+				}
+
+				/* Add tags to the page */
+				if (!tagList.isEmpty()) {
+
+					Tag[] tags = tagList.toArray(new Tag[tagList.size()]);
+					tagManager.setTags(eventPage.getContentResource(), tags);
+
 				}
 				
 				/* Save everything */
