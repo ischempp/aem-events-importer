@@ -22,6 +22,7 @@ import javax.jcr.RepositoryException;
 import javax.jcr.Session;
 
 import org.apache.felix.scr.annotations.Activate;
+import org.apache.felix.scr.annotations.Deactivate;
 import org.apache.felix.scr.annotations.Component;
 import org.apache.felix.scr.annotations.Properties;
 import org.apache.felix.scr.annotations.Property;
@@ -50,6 +51,8 @@ import com.day.cq.tagging.Tag;
 
 import org.fhcrc.centernet.Constants;
 import org.fhcrc.common.util.PageUtilities;
+import org.fhcrc.common.services.EmailService;
+import org.fhcrc.common.services.ErrorEmailService;
 
 @Service(value = java.lang.Runnable.class)
 @Component(name = "org.fhcrc.centernet.service.LMSEventImporter", 
@@ -64,22 +67,25 @@ import org.fhcrc.common.util.PageUtilities;
 		boolValue = true, propertyPrivate = true),	
 	@Property(name = "scheduler.expression", label = "LMS Importer Cron Expression", 
 		description = "Cron expression to determine when the LMS Importer will be initiated.", 
-		value = "0 0/1 * * * ? *"),
-	@Property(name = "service.target", value= "/content/centernet/en/e/training/lms-import", 
+		value = "0 0 4 1/1 * ? *"),
+	@Property(name = "service.target", value= "/content/centernet/en/e/lms-import", 
 		description = "Location in JCR where new events should be placed", label = "Importer target location"),
-	@Property(name = "service.dataSource", value="https://is.fhcrc.org/sites/centernet/lms/full.txt",
+	@Property(name = "service.dataSource", value="https://is.fhcrc.org/sites/centernet/lms/lms-import-data.txt",
 		description = "URL at which to find the tab-separated data file for this service to ingest",
 		label = "Data source URL")
 })
 public class LMSEventImporter implements Runnable {
 	
+	/* Logging and defaults */
 	private static final Logger log = LoggerFactory.getLogger(LMSEventImporter.class);
 	private static final String LOGGING_PREFIX = "LMS IMPORTER: ";
-	private static final String TARGET_PATH_DEFAULT = "/content/centernet/en/e/training/lms-import";
+	private static final String TARGET_PATH_DEFAULT = "/content/centernet/en/e/lms-import";
 	private static final String DEFAULT_PAGE_NAME = "imported-training-event";
+	/* Scaffolding information */
 	private static final String PROP_SCAFFOLDING = "cq:scaffolding";
 	private static final String PROP_RESOURCE_TYPE = "sling:resourceType";
 	private static final String EVENT_SCAFFOLDING_TEMPLATE = "/etc/scaffolding/centernet/event-scaffoling";
+	/* Event Page and Event Details component information */
 	private static final String EVENT_COMPONENT_RES = "centernet/components/page/event";
 	private static final String EVENT_DETAILS_NODE = "eventdetails";
 	private static final String EVENT_BUTTON_NODE = "button";
@@ -97,7 +103,9 @@ public class LMSEventImporter implements Runnable {
 	private static final String PN_EVENT_BUTTON_URL = "linkUrl";
 	private static final String PN_EVENT_UID = "eventId";
 	private static final String TRAINING_EVENT_CATEGORY_TAG_ID = "web-event-categories:training";
-	private static final String TRAINING_DEPARTMENT_TAG_ID = "web-depts:AD/AD0603";
+	/* Error alerting contacts */
+	private static final String HR_TRAINING_EMAIL_CONTACT = "hutchlearning@fredhutch.org";
+	private static final String COMMUNICATIONS_EMAIL_CONTACT = "websys@fredhutch.org";
 	
 	/* The fields we expect to get from the data file and their order */
 	private final Integer TITLE = 0;
@@ -121,6 +129,33 @@ public class LMSEventImporter implements Runnable {
 	/* Number of fields we expect so we can check each line before we commit to importing it */
 	private final Integer EXPECTED_NUMBER_OF_FIELDS = 17;
 	
+	/* Vendor values from Cornerstone. If new Vendors are added, they must be added here as well */
+	final String PN_VENDOR_CIT = "Center IT";
+	final String PN_VENDOR_CRS = "Clinical Research Support (CRS)";
+	final String PN_VENDOR_COMMUNICATIONS = "Communications & Marketing";
+	final String PN_VENDOR_EHS = "Environmental Health & Safety (EH&S)";
+	final String PN_VENDOR_FINANCIAL_PLANNING = "Financial Planning and Analysis";
+	final String PN_VENDOR_FMIS = "FMIS";
+	final String PN_VENDOR_FRED_HUTCH = "Fred Hutch";
+	final String PN_VENDOR_HR_TRAINING = "HR Training";
+	final String PN_VENDOR_RESEARCH_ETHICS = "Hutch Research Ethics Education Program";
+	final String PN_VENDOR_IRO = "Institutional Review Office (IRO)";
+	final String PN_VENDOR_OSR = "Office of Sponsored Research";
+	
+	/* Department tag IDs for the vendors listed above */
+	final String PN_TAG_CIT = "web-depts:AD/AD07";
+	final String PN_TAG_CRS = "web-depts:AD/AD0103";
+	final String PN_TAG_COMMUNICATIONS = "web-depts:AD/AD09";
+	final String PN_TAG_EHS = "web-depts:AD/AD0303";
+	final String PN_TAG_FINANCIAL_PLANNING = "web-depts:AD/AD0405";
+	final String PN_TAG_FMIS = "web-depts:AD/AD04013";
+	final String PN_TAG_FRED_HUTCH = "";
+	final String PN_TAG_HR_TRAINING = "web-depts:AD/AD0603";
+	final String PN_TAG_RESEARCH_ETHICS = "web-depts:HX/HX011";
+	final String PN_TAG_IRO = "web-depts:AD/AD0101";
+	final String PN_TAG_OSR = "web-depts:AD/AD0402";
+	
+	/* Class fields */
 	private String targetPath;
 	private String dataSource;
 	private Session adminSession;
@@ -128,12 +163,16 @@ public class LMSEventImporter implements Runnable {
 	private TagManager tagManager;
 	private ResourceResolver resResolver;
 	private Map<String, String> uidMap;
+	private Map<String, String> tagMap;
 	
 	@Reference
 	private ResourceResolverFactory factory;
 	
 	@Reference
 	private Replicator replicator;
+	
+	@Reference
+	private EmailService errorEmailService;
 	
 	@Activate
 	private void activate(ComponentContext context) {	
@@ -145,6 +184,11 @@ public class LMSEventImporter implements Runnable {
         dataSource = OsgiUtil.toString(properties, "service.dataSource", new String());
         
     }
+	
+	@Deactivate
+	private void deactivate() {
+		log.info(LOGGING_PREFIX + "Service deactivated");
+	}
 
 	@Override
 	public void run() {
@@ -155,9 +199,11 @@ public class LMSEventImporter implements Runnable {
 		log.info(LOGGING_PREFIX + "dataSource = " + dataSource);
 		
 		uidMap = createUIDMap();
+		tagMap = createTagMap();
 		
 		try {
 			
+			/* Open connection to the data source as set in the OSGi configs */
 			URL dataurl = new URL(dataSource);
 			URLConnection dataConnection = dataurl.openConnection();
 			
@@ -169,11 +215,18 @@ public class LMSEventImporter implements Runnable {
 			while ((inputLine = dataReader.readLine()) != null) {
 				
 				log.debug(LOGGING_PREFIX + "inputLine = " + inputLine);
+				/* The data is a tab-delimited string */
 				String[] data = inputLine.split("\t");
+				/* If we have the wrong number of fields, notify HR Training and move on to the next line */
 				if (data.length != EXPECTED_NUMBER_OF_FIELDS) {
-					//TODO Send an email to HR alerting them of the failure and the data that failed.
-					log.error(LOGGING_PREFIX + "Unexpected number of fields from LMS output. Aborting line starting with " + data[0]);
+					
+					String errorString = createDataDump(data);
+					errorEmailService.sendEmail(HR_TRAINING_EMAIL_CONTACT, 
+							"AEM LMS importer error: Unexpected number of fields", 
+							errorString);
+					log.error(LOGGING_PREFIX + "Unexpected number of fields from LMS output. Aborting line " + errorString);
 					continue;
+					
 				} else {
 					
 					createEventNode(data);
@@ -184,8 +237,10 @@ public class LMSEventImporter implements Runnable {
 			
 		} catch (MalformedURLException e) {
 			log.error(LOGGING_PREFIX + "Incorrect URL for data file: " + dataSource);
+			errorEmailService.sendEmail(COMMUNICATIONS_EMAIL_CONTACT, "LMS importer error: malformed URL for data file", e.getMessage());
 		} catch (IOException e) {
 			log.error(LOGGING_PREFIX + "Problem reading data file");
+			errorEmailService.sendEmail(COMMUNICATIONS_EMAIL_CONTACT, "LMS importer error: cannot read data file", e.getMessage());
 		}
 		
 	}
@@ -215,11 +270,30 @@ public class LMSEventImporter implements Runnable {
 			return cal;
 		} catch (ParseException e) {
 			log.error(LOGGING_PREFIX + "Incorrectly formatted date string: " + dateString + " " + timeString, e);
+			StringBuffer errorSb = new StringBuffer();
+			errorSb.append("<p style=\"line-height: 20px; font-family: Arial, 'Helvetica Neue', Helvetica, sans-serif; font-size: 16px;\">");
+			errorSb.append("I found the following date and time strings in the data file that could not be parsed by the importer:");
+			errorSb.append("<br>");
+			errorSb.append("Date string (must be formatted MM/dd/yyyy): ");
+			errorSb.append(dateString);
+			errorSb.append("<br>");
+			errorSb.append("Time string (must be formatted HH:mm:ss): ");
+			errorSb.append(timeString);
+			errorSb.append("</p>");
+			errorEmailService.sendEmail(HR_TRAINING_EMAIL_CONTACT, 
+					"AEM LMS importer error: incorrectly formatted date in data file", 
+					errorSb.toString());
 			return null;
 		}
 		
 	}
 	
+	/**
+	 * Workhorse function that takes in the line of data from the file and 
+	 * either creates a new Event Page or updates the Event Page whose UID 
+	 * matches the one in the UID field.
+	 * @param data - String[] containing EXPECTED_NUMBER_OF_FIELDS entries
+	 */
 	@SuppressWarnings("deprecation")
 	private void createEventNode(String[] data) {
 		
@@ -232,6 +306,7 @@ public class LMSEventImporter implements Runnable {
 		SimpleDateFormat justTheMonth = new SimpleDateFormat("MMM"),
 				justTheDay = new SimpleDateFormat("dd");
 		
+		/* If there is a Start Date and Start Time, then set the startCal Calendar */
 		if (!data[START_DATE].trim().isEmpty() && !data[START_TIME].trim().isEmpty()) {
 			
 			startCal = createDate(data[START_DATE], data[START_TIME]);
@@ -244,15 +319,15 @@ public class LMSEventImporter implements Runnable {
 			}
 			
 		} else {
-			//TODO No start date means no event. Report this error to HR Training.
-			StringBuffer sb = new StringBuffer();
-			for (String s : data) {
-				sb.append(s);
-				sb.append("||");
-			}
 			
-			log.error(LOGGING_PREFIX + "Event contained no start date. Data array dump: " + sb.toString());
+			/* If there was no Start Time, we can't make a meaningful Event, so
+			 * notify HR Training and move on to the next line of data. */
+			String dataDump = createDataDump(data);
+			
+			errorEmailService.sendEmail(HR_TRAINING_EMAIL_CONTACT, "AEM LMS importer error: Event contains no Start Date", dataDump);
+			log.error(LOGGING_PREFIX + "Event contained no start date. Data array dump: " + dataDump);
 			return;
+			
 		}
 		
 		try {
@@ -265,9 +340,10 @@ public class LMSEventImporter implements Runnable {
 			Page eventPage = null;
 			String pageName = null;
 			Tag categoryTag = tagManager.resolve(TRAINING_EVENT_CATEGORY_TAG_ID),
-					departmentTag = tagManager.resolve(TRAINING_DEPARTMENT_TAG_ID);
+					departmentTag = getVendorTag(data[HOST], tagManager);
 			List<Tag> tagList = new ArrayList<Tag>();
 			
+			/* Populate the list of tags we will later add to the page */
 			if (categoryTag != null) {
 				tagList.add(categoryTag);
 			} else {
@@ -277,9 +353,9 @@ public class LMSEventImporter implements Runnable {
 			if (departmentTag != null) {
 				tagList.add(departmentTag);
 			} else {
-				log.warn(LOGGING_PREFIX + "Problem resolving department tag " + TRAINING_DEPARTMENT_TAG_ID);
+				log.warn(LOGGING_PREFIX + "Problem resolving vendor to department tag " + data[HOST]);
 			}
-						
+			
 			String[] dateParts = data[START_DATE].split("/");
 			/* Make sure we actually have a date here */
 			if (dateParts.length > 1) {
@@ -290,7 +366,8 @@ public class LMSEventImporter implements Runnable {
 				Node importPathBaseNode = JcrUtils.getOrCreateByPath(targetPath, "sling:OrderedFolder", adminSession);
 				Node importPathWithDate = JcrUtils.getOrCreateByPath(importPathBaseNode.getPath() + datePath, "sling:OrderedFolder", adminSession);
 				
-				/* This will need to be changed to a UID later */
+				/* Name of the page is of the format <EVENT TITLE>-MMM-dd
+				 * (e.g. aem-basic-training-jan-01 */
 				if (data[TITLE] != null && !data[TITLE].isEmpty()) {
 					// 57 is 64 - (length of month string + length of day string + 2 hyphens)
 					pageName = data[TITLE].substring(0, Math.min(data[TITLE].length(), 57));
@@ -324,24 +401,18 @@ public class LMSEventImporter implements Runnable {
 				eventPageContentNode.setProperty(PROP_RESOURCE_TYPE, EVENT_COMPONENT_RES);
 				/* Create the eventdetails node */
 				Node eventDetailsNode = JcrUtils.getOrCreateByPath(eventPageContentNode.getPath() + "/" + EVENT_DETAILS_NODE, "nt:unstructured", adminSession);
-
-				if (startCal == null) {
-					//TODO More drastic action should be taken here, send an email alert?
-				} else {
-					eventDetailsNode.setProperty(PN_EVENT_START, startCal);
-				}
-
-				if (endCal == null) {
-					//TODO More drastic action should be taken here, send an email alert?
-				} else {
-					eventDetailsNode.setProperty(PN_EVENT_END, endCal);
-				}
-
+				eventDetailsNode.setProperty(PN_EVENT_START, startCal);
+				eventDetailsNode.setProperty(PN_EVENT_END, endCal);
 
 				/* Start setting properties if they exist */
+				String desc = null;
 				if (!data[DESCRIPTION].trim().isEmpty()) {
-					eventDetailsNode.setProperty(PN_EVENT_DESCRIPTION, data[DESCRIPTION]);
+					desc = appendSCCAButton(data[DESCRIPTION]);	
+				} else {
+					desc = appendSCCAButton("");
 				}
+				eventDetailsNode.setProperty(PN_EVENT_DESCRIPTION, desc);
+				
 				if (!data[LOCATION].trim().isEmpty()) {
 					eventDetailsNode.setProperty(PN_EVENT_LOCATION, data[LOCATION]);
 				}
@@ -386,6 +457,17 @@ public class LMSEventImporter implements Runnable {
 				/* Save everything */
 				adminSession.save();
 				
+				/* If TrainingIsActive == false, then deactivate the page */
+				if (eventPage != null && data[IS_ACTIVE].toLowerCase().equals("false")) {
+					
+					try {
+						replicator.replicate(adminSession, ReplicationActionType.DEACTIVATE, eventPage.getPath());
+					} catch (ReplicationException e) {
+						log.error(LOGGING_PREFIX + "Problem deactivating page " + eventPage.getPath(), e);
+					}
+
+				}
+				
 				/* Replicate the page in question */
 				if (eventPage != null) {
 					
@@ -412,6 +494,7 @@ public class LMSEventImporter implements Runnable {
 			log.error(LOGGING_PREFIX + "Repo Exception attempting to create imported event node", e);
 		} catch (WCMException e) {
 			log.error(LOGGING_PREFIX + "WCM Exception attempting to replicate imported event node", e);
+			errorEmailService.sendEmail(COMMUNICATIONS_EMAIL_CONTACT, "LMS Importer error: Cannot replicate event", e.getMessage());
 		} finally {
 
 			/* Double-check that we are logged out */
@@ -423,6 +506,9 @@ public class LMSEventImporter implements Runnable {
 		
 	}
 	
+	/*
+	 * Initializes a map of Cornerstone UIDs to AEM paths
+	 */
 	@SuppressWarnings("deprecation")
 	private Map<String, String> createUIDMap() {
 		
@@ -474,6 +560,118 @@ public class LMSEventImporter implements Runnable {
 	    }
 		
 		return uidMap;
+		
+	}
+	
+	/*
+	 * Initializes the tagMap of vendor titles to tag IDs
+	 */
+	private Map<String, String> createTagMap() {
+		
+		Map<String, String> map = new HashMap<String, String>();
+		
+		map.put(PN_VENDOR_CIT, PN_TAG_CIT);
+		map.put(PN_VENDOR_CRS, PN_TAG_CRS);
+		map.put(PN_VENDOR_COMMUNICATIONS, PN_TAG_COMMUNICATIONS);
+		map.put(PN_VENDOR_EHS, PN_TAG_EHS);
+		map.put(PN_VENDOR_FINANCIAL_PLANNING, PN_TAG_FINANCIAL_PLANNING);
+		map.put(PN_VENDOR_FRED_HUTCH, PN_TAG_FRED_HUTCH);
+		map.put(PN_VENDOR_FMIS, PN_TAG_FMIS);
+		map.put(PN_VENDOR_HR_TRAINING, PN_TAG_HR_TRAINING);
+		map.put(PN_VENDOR_RESEARCH_ETHICS, PN_TAG_RESEARCH_ETHICS);
+		map.put(PN_VENDOR_IRO, PN_TAG_IRO);
+		map.put(PN_VENDOR_OSR, PN_TAG_OSR);
+		
+		return map;
+		
+	}
+	
+	/*
+	 * Turns a String array into a double-pipe-separated String to be passed to
+	 * an error log or email.
+	 * 
+	 * @param String[] data - the array of data to be logged/emailed.
+	 * 
+	 * @returns String - a double-pipe-separated list of the data in the array
+	 */
+	private String createDataDump(String[] data) {
+		
+		StringBuffer sb = new StringBuffer();
+		for (String s : data) {
+			sb.append(s);
+			sb.append("||");
+		}
+		
+		return sb.toString();
+		
+	}
+	
+	/*
+	 * Checks the tagMap to see if there is a vendor with the passed name and,
+	 * if so, returns the department tag associated with that vendor. If there
+	 * is no vendor or no tag associated with that vendor, returns null
+	 * 
+	 * @param String vendor - the name of the vendor. Should match one of the 
+	 * constants listed above in the PN_VENDOR section.
+	 * @param TagManager tagManager
+	 * 
+	 * @returns Tag - the department tag to place on this event
+	 */
+	private Tag getVendorTag(String vendor, TagManager tagManager) {
+		
+		Tag t;
+		String tagID;
+		
+		if (tagMap.containsKey(vendor)) {
+			
+			tagID = tagMap.get(vendor);
+			t = tagManager.resolve(tagID);
+			
+		} else {
+			
+			t = null;
+			
+		}
+		
+		return t;
+		
+	}
+	
+	/**
+	 * Appends an HTML String that happens to be the code for a Button
+	 * Component. See buttoncomponent.html in the Common CQ Package for the
+	 * template this HTML was based on.
+	 * @param s String representing the Event Description field of the imported
+	 * event.
+	 * @return the argument, s, with the code for a Button Component appended
+	 * to the end of it.
+	 */
+	private String appendSCCAButton(String s) {
+
+		StringBuffer sb = new StringBuffer();
+		/* Null protection */
+		if (s == null) {
+			s = "";
+		}
+		
+		/* Start with the original String */
+		sb.append(s);
+		/* Append the button HTML */
+		sb.append("<p>");
+		sb.append("<b>SCCA Employees:</b> to register for this course, ");
+		sb.append("access Hutch Learning.");
+		sb.append("</p>");
+		sb.append("<div class=\"fh-component-button\">");
+		sb.append("<a href=\"");
+		/* This URL supplied by Sarah Koehn from HR Training */
+		sb.append("https://auth.seattlecca.org/FHLMS/");
+		sb.append("\">");
+		/* The text visible inside the button */
+		sb.append("Hutch Learning - SCCA");
+		sb.append("</a>");
+		sb.append("</div>");
+		
+		return sb.toString();
 		
 	}
 
